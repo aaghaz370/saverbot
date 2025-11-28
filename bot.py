@@ -465,6 +465,26 @@ Send post link:
             last_update = 0
             entity = await client.get_entity(channel_entity)
             
+            # Get messages in batch for better performance
+            logger.info(f"Fetching messages starting from {start_msg_id}")
+            
+            # Try to get the starting message first to verify it exists
+            try:
+                test_start = await client.get_messages(entity, ids=start_msg_id)
+                if not test_start or test_start.empty:
+                    await bot.send_message(user_id, f"⚠️ Starting message {start_msg_id} not found!\n\nTry a different message ID.")
+                    active_extractions[user_id] = False
+                    if client != bot:
+                        await client.disconnect()
+                    return
+                logger.info(f"Starting message {start_msg_id} exists: media={bool(test_start.media)}, text={bool(test_start.text)}")
+            except Exception as e:
+                await bot.send_message(user_id, f"❌ Cannot access message {start_msg_id}!\n\nError: {str(e)}")
+                active_extractions[user_id] = False
+                if client != bot:
+                    await client.disconnect()
+                return
+            
             for i in range(count):
                 if not active_extractions.get(user_id):
                     await bot.send_message(user_id, "❌ Cancelled!")
@@ -475,8 +495,16 @@ Send post link:
                 
                 try:
                     message = await client.get_messages(entity, ids=msg_id)
+                    
+                    # Detailed logging
+                    logger.info(f"Message {msg_id}: exists={message is not None}, empty={message.empty if message else 'N/A'}")
+                    if message and not message.empty:
+                        logger.info(f"Message {msg_id}: has_media={bool(message.media)}, media_type={type(message.media).__name__ if message.media else 'None'}, has_text={bool(message.text)}")
+                    
                     if not message or message.empty:
+                        logger.warning(f"Message {msg_id} is None or empty - skipping")
                         failed += 1
+                        await bot.send_message(user_id, f"⚠️ Message {msg_id} not found or empty")
                         continue
                     
                     caption = message.text or ""
@@ -491,35 +519,62 @@ Send post link:
                     
                     sent = False
                     if message.media:
+                        logger.info(f"Processing media for message {msg_id}")
                         try:
                             if isinstance(message.media, MessageMediaWebPage):
+                                logger.info(f"Message {msg_id} is webpage preview")
                                 if caption:
                                     await bot.send_message(target_chat, caption)
                                     sent = True
+                                    logger.info(f"Sent webpage caption for {msg_id}")
                             else:
+                                logger.info(f"Message {msg_id} has media type: {type(message.media).__name__}")
                                 try:
+                                    # Try direct send first
+                                    logger.info(f"Attempting direct send for {msg_id}")
                                     await bot.send_file(target_chat, message.media, caption=caption or None, force_document=False)
                                     sent = True
-                                except:
+                                    logger.info(f"Direct send successful for {msg_id}")
+                                except Exception as direct_err:
+                                    # Try download and re-upload
+                                    logger.warning(f"Direct send failed for {msg_id}: {str(direct_err)[:100]}, trying download...")
                                     file_path = await client.download_media(message.media, file=temp_dir)
                                     if file_path and os.path.exists(file_path):
+                                        logger.info(f"Downloaded {msg_id} to: {file_path}")
                                         await bot.send_file(target_chat, file_path, caption=caption or None, force_document=False)
                                         sent = True
+                                        logger.info(f"Re-upload successful for {msg_id}")
                                         os.remove(file_path)
                                         file_path = None
+                                    else:
+                                        logger.error(f"Download failed for {msg_id}, no file created")
                         except Exception as media_err:
-                            logger.error(f"Media error {msg_id}: {media_err}")
+                            logger.error(f"Media error {msg_id}: {str(media_err)}", exc_info=True)
+                            # If media fails but we have caption, send caption at least
                             if caption:
-                                await bot.send_message(target_chat, f"⚠️ Media failed:\n{caption}")
-                                sent = True
+                                try:
+                                    await bot.send_message(target_chat, f"⚠️ Media failed for post {msg_id}:\n\n{caption}")
+                                    sent = True
+                                    logger.info(f"Sent caption only for {msg_id}")
+                                except Exception as cap_err:
+                                    logger.error(f"Caption send also failed for {msg_id}: {cap_err}")
                     elif caption:
+                        logger.info(f"Message {msg_id} is text only")
                         await bot.send_message(target_chat, caption)
                         sent = True
+                        logger.info(f"Sent text for {msg_id}")
+                    else:
+                        logger.warning(f"Message {msg_id} has no media and no text - empty post")
                     
                     if sent:
                         extracted += 1
+                        logger.info(f"✅ Successfully processed {msg_id} (total: {extracted})")
                     else:
                         failed += 1
+                        logger.warning(f"❌ Failed to process {msg_id} (total failed: {failed})")
+                        # Send notification for first few failures
+                        if failed <= 3:
+                            await bot.send_message(user_id, f"⚠️ Failed to extract message {msg_id} - might be deleted or empty")
                     
                     if extracted - last_update >= 5 or i == count - 1:
                         try:
