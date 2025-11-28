@@ -471,7 +471,7 @@ Send post link:
             # Try to get the starting message first to verify it exists
             try:
                 test_start = await client.get_messages(entity, ids=start_msg_id)
-                if not test_start or test_start.empty:
+                if not test_start:
                     await bot.send_message(user_id, f"⚠️ Starting message {start_msg_id} not found!\n\nTry a different message ID.")
                     active_extractions[user_id] = False
                     if client != bot:
@@ -479,6 +479,7 @@ Send post link:
                     return
                 logger.info(f"Starting message {start_msg_id} exists: media={bool(test_start.media)}, text={bool(test_start.text)}")
             except Exception as e:
+                logger.error(f"Error checking start message: {e}", exc_info=True)
                 await bot.send_message(user_id, f"❌ Cannot access message {start_msg_id}!\n\nError: {str(e)}")
                 active_extractions[user_id] = False
                 if client != bot:
@@ -496,16 +497,16 @@ Send post link:
                 try:
                     message = await client.get_messages(entity, ids=msg_id)
                     
-                    # Detailed logging
-                    logger.info(f"Message {msg_id}: exists={message is not None}, empty={message.empty if message else 'N/A'}")
-                    if message and not message.empty:
-                        logger.info(f"Message {msg_id}: has_media={bool(message.media)}, media_type={type(message.media).__name__ if message.media else 'None'}, has_text={bool(message.text)}")
-                    
-                    if not message or message.empty:
-                        logger.warning(f"Message {msg_id} is None or empty - skipping")
+                    # Check if message exists - proper way for Telethon
+                    if not message:
+                        logger.warning(f"Message {msg_id} returned None - doesn't exist")
                         failed += 1
-                        await bot.send_message(user_id, f"⚠️ Message {msg_id} not found or empty")
+                        if failed <= 3:
+                            await bot.send_message(user_id, f"⚠️ Message {msg_id} not found")
                         continue
+                    
+                    # Detailed logging
+                    logger.info(f"Message {msg_id}: has_media={bool(message.media)}, media_type={type(message.media).__name__ if message.media else 'None'}, has_text={bool(message.text)}, message_type={type(message).__name__}")
                     
                     caption = message.text or ""
                     for old, new in settings.replace_words.items():
