@@ -4,11 +4,13 @@ import asyncio
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneNumberInvalidError, ChannelPrivateError, ChatWriteForbiddenError
-from telethon.tl.types import Channel, Chat
+from telethon.tl.types import Channel, Chat, MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage
 from flask import Flask
 from threading import Thread
 import logging
 from typing import Dict, List, Optional
+import tempfile
+import shutil
 
 # Configure logging
 logging.basicConfig(
@@ -49,6 +51,10 @@ app = Flask('')
 def home():
     return "Bot is running! ✅"
 
+@app.route('/health')
+def health():
+    return {"status": "ok", "bot": "running"}
+
 def run():
     app.run(host='0.0.0.0', port=PORT)
 
@@ -60,25 +66,22 @@ def keep_alive():
 
 def parse_channel_link(link: str):
     """Parse channel link and return entity and message ID"""
-    # Remove whitespace
     link = link.strip()
     
     # Pattern 1: t.me/c/CHANNEL_ID/MSG_ID (private channel)
     match = re.search(r't\.me/c/(\d+)/(\d+)', link)
     if match:
         channel_id = int(match.group(1))
-        # Correct conversion: Add -100 prefix to channel ID
-        # t.me/c/2342349151 becomes -1002342349151 (NOT -1001002342349151)
         channel_entity = int(f"-100{channel_id}")
         msg_id = int(match.group(2))
-        return channel_entity, msg_id, True  # is_private=True
+        return channel_entity, msg_id, True
     
     # Pattern 2: t.me/USERNAME/MSG_ID (public channel)
     match = re.search(r't\.me/([^/]+)/(\d+)', link)
     if match:
         username = match.group(1)
         msg_id = int(match.group(2))
-        return username, msg_id, False  # is_private=False
+        return username, msg_id, False
     
     return None, None, None
 
@@ -169,8 +172,8 @@ Main **PUBLIC aur PRIVATE** dono channels se posts extract kar sakta hoon!
 ⚠️ Bot can't extract from channels you haven't joined
 
 **Rate Limits:**
-• Free: 3 posts per batch
-• Premium: 1000 posts per batch
+• Max: 1000 posts per batch
+• Recommended: 10-50 posts
 
 Need help? Just ask! 😊
 """
@@ -211,8 +214,7 @@ Need help? Just ask! 😊
             await event.respond(
                 f"🔑 **Your Session String:**\n\n"
                 f"`{session_str[:50]}...`\n\n"
-                f"⚠️ Keep this private! Anyone with this can access your account.\n\n"
-                f"Full session (for debug.py):\n`{session_str}`"
+                f"⚠️ Keep this private! Anyone with this can access your account."
             )
         else:
             await event.respond("❌ You're not logged in. Use /login first.")
@@ -396,7 +398,6 @@ Need help? Just ask! 😊
                     )
                     return
                 
-                # Check if private and not logged in
                 if is_private and user_id not in user_sessions:
                     await event.respond(
                         "⚠️ **Private Channel Detected!**\n\n"
@@ -495,10 +496,18 @@ Need help? Just ask! 😊
                 del user_conversations[user_id]
 
     async def extract_posts(bot, user_id, channel_entity, start_msg_id, count, is_private):
-        """Main extraction logic"""
+        """Main extraction logic with improved file handling"""
         logger.info(f"Starting extraction for {user_id}: {channel_entity}, {start_msg_id}, {count}, private={is_private}")
+        
+        temp_dir = None
+        client = None
+        
         try:
             active_extractions[user_id] = True
+            
+            # Create temporary directory for this extraction session
+            temp_dir = tempfile.mkdtemp(prefix=f"telegram_extract_{user_id}_")
+            logger.info(f"Created temp directory: {temp_dir}")
             
             # CRITICAL: For private channels, MUST use user session
             if is_private:
@@ -526,10 +535,16 @@ Need help? Just ask! 😊
             # Test access
             try:
                 await bot.send_message(user_id, "🔍 Testing channel access...")
-                test_msg = await client.get_messages(channel_entity, limit=1)
+                
+                # Try to get the entity first
+                entity = await client.get_entity(channel_entity)
+                logger.info(f"Got entity: {entity.title if hasattr(entity, 'title') else entity}")
+                
+                # Then try to get a message
+                test_msg = await client.get_messages(entity, limit=1)
                 
                 if not test_msg or len(test_msg) == 0:
-                    raise ValueError("Cannot access channel")
+                    raise ValueError("Cannot access channel messages")
                 
                 await bot.send_message(user_id, "✅ Access verified! Starting extraction...")
                 
@@ -569,7 +584,8 @@ Need help? Just ask! 😊
             # Test target chat permissions
             if target_chat != user_id:
                 try:
-                    await bot.send_message(target_chat, "🧪 Testing permissions...")
+                    test_msg = await bot.send_message(target_chat, "🧪 Testing permissions...")
+                    await test_msg.delete()
                     await bot.send_message(user_id, f"✅ Target channel accessible: {target_chat}")
                 except Exception as perm_err:
                     await bot.send_message(
@@ -597,32 +613,27 @@ Need help? Just ask! 😊
             failed = 0
             last_update = 0
             
+            # Get the entity once for better performance
+            entity = await client.get_entity(channel_entity)
+            
             for i in range(count):
                 if not active_extractions.get(user_id):
                     await bot.send_message(user_id, "❌ Cancelled!")
                     break
                 
                 msg_id = start_msg_id + i
+                file_path = None
                 
                 try:
-                    message = await client.get_messages(channel_entity, ids=msg_id)
+                    # Get message from source
+                    message = await client.get_messages(entity, ids=msg_id)
                     
-                    if not message:
-                        logger.warning(f"Message {msg_id} returned None")
+                    if not message or message.empty:
+                        logger.warning(f"Message {msg_id} not found or empty")
                         failed += 1
-                        if failed == 1:
-                            await bot.send_message(user_id, f"⚠️ Message {msg_id} not found (None)")
                         continue
                     
-                    if message.empty:
-                        logger.warning(f"Message {msg_id} is empty")
-                        failed += 1
-                        if failed == 1:
-                            await bot.send_message(user_id, f"⚠️ Message {msg_id} is empty/deleted")
-                        continue
-                    
-                    # Log message details for debugging
-                    logger.info(f"Message {msg_id}: has_media={bool(message.media)}, has_text={bool(message.text)}, type={type(message.media).__name__ if message.media else 'None'}")
+                    logger.info(f"Processing message {msg_id}: media={bool(message.media)}, text={bool(message.text)}")
                     
                     # Process caption
                     caption = message.text or ""
@@ -636,107 +647,130 @@ Need help? Just ask! 😊
                     if settings.custom_caption:
                         caption = f"{caption}\n\n{settings.custom_caption}" if caption else settings.custom_caption
                     
-                    # Send message - try multiple methods
-                    sent_successfully = False
-                    send_error_msg = ""
+                    # Limit caption length
+                    if len(caption) > 1024:
+                        caption = caption[:1021] + "..."
                     
-                    try:
-                        if message.media:
-                            # Method 1: Try with file
-                            try:
-                                await bot.send_file(
-                                    target_chat,
-                                    message.media,
-                                    caption=caption[:1024] if caption else None,
-                                    thumb=settings.thumbnail,
-                                    force_document=False
-                                )
-                                sent_successfully = True
-                            except Exception as e1:
-                                # Method 2: Try downloading and re-uploading
-                                file_path = None
+                    # Send message based on type
+                    sent = False
+                    
+                    if message.media:
+                        try:
+                            # For media messages
+                            if isinstance(message.media, MessageMediaWebPage):
+                                # Webpage preview - send as text
+                                if caption:
+                                    await bot.send_message(target_chat, caption)
+                                    sent = True
+                            else:
+                                # Try direct forward first (most efficient)
                                 try:
-                                    file_path = await client.download_media(message.media)
-                                    if file_path:
+                                    await bot.send_file(
+                                        target_chat,
+                                        message.media,
+                                        caption=caption if caption else None,
+                                        force_document=False
+                                    )
+                                    sent = True
+                                    logger.info(f"Direct media send successful for {msg_id}")
+                                except Exception as direct_err:
+                                    logger.warning(f"Direct send failed for {msg_id}, trying download: {direct_err}")
+                                    
+                                    # Download to temp directory
+                                    file_path = await client.download_media(
+                                        message.media,
+                                        file=temp_dir
+                                    )
+                                    
+                                    if file_path and os.path.exists(file_path):
+                                        logger.info(f"Downloaded to: {file_path}")
+                                        
+                                        # Upload from temp file
                                         await bot.send_file(
                                             target_chat,
                                             file_path,
-                                            caption=caption[:1024] if caption else None,
-                                            thumb=settings.thumbnail,
+                                            caption=caption if caption else None,
                                             force_document=False
                                         )
-                                        sent_successfully = True
-                                except Exception as e2:
-                                    send_error_msg = f"Media error: {str(e1)[:50]} / {str(e2)[:50]}"
-                                finally:
-                                    # Clean up - GUARANTEED
-                                    if file_path and os.path.exists(file_path):
+                                        sent = True
+                                        logger.info(f"File upload successful for {msg_id}")
+                                        
+                                        # Immediate cleanup
                                         try:
                                             os.remove(file_path)
-                                        except Exception as cleanup_err:
-                                            logger.error(f"Cleanup error: {cleanup_err}")
+                                            logger.info(f"Deleted temp file: {file_path}")
+                                        except Exception as del_err:
+                                            logger.error(f"Error deleting {file_path}: {del_err}")
+                                        
+                                        file_path = None
+                                    else:
+                                        raise ValueError("Download failed - no file created")
                         
-                        elif caption:
-                            await bot.send_message(target_chat, caption)
-                            sent_successfully = True
-                        
-                        else:
-                            # Empty message - send placeholder
-                            await bot.send_message(target_chat, f"📄 Post #{msg_id}")
-                            sent_successfully = True
-                        
-                        if sent_successfully:
-                            extracted += 1
-                            logger.info(f"Successfully sent message {msg_id}")
-                        else:
-                            failed += 1
-                            logger.error(f"Failed to send {msg_id}: {send_error_msg}")
+                        except Exception as media_err:
+                            logger.error(f"Media error for {msg_id}: {media_err}")
                             
-                            # Show error for first 3 failures
-                            if failed <= 3:
-                                await bot.send_message(
-                                    user_id,
-                                    f"⚠️ **Failed #{failed}**\n\n"
-                                    f"Post ID: {msg_id}\n"
-                                    f"Error: {send_error_msg}"
-                                )
-                        
-                    except Exception as send_err:
-                        failed += 1
-                        error_detail = str(send_err)
-                        logger.error(f"Send error {msg_id}: {error_detail}")
-                        
-                        # Show detailed error for first failures
-                        if failed <= 3:
-                            await bot.send_message(
-                                user_id,
-                                f"❌ **Send Failed #{failed}**\n\n"
-                                f"Message ID: {msg_id}\n"
-                                f"Target: {target_chat}\n"
-                                f"Error: {error_detail[:200]}\n\n"
-                                f"{'⚠️ Make sure bot is ADMIN in target channel!' if 'admin' in error_detail.lower() or 'permission' in error_detail.lower() else ''}"
-                            )
+                            # If media fails but we have caption, send caption at least
+                            if caption:
+                                try:
+                                    await bot.send_message(target_chat, f"⚠️ Media failed, caption only:\n\n{caption}")
+                                    sent = True
+                                except:
+                                    pass
                     
-                    # Update progress
-                    if extracted - last_update >= 5:
+                    elif caption:
+                        # Text only message
+                        await bot.send_message(target_chat, caption)
+                        sent = True
+                    
+                    else:
+                        # Empty message
+                        logger.warning(f"Message {msg_id} has no content")
+                    
+                    if sent:
+                        extracted += 1
+                        logger.info(f"Successfully sent message {msg_id}")
+                    else:
+                        failed += 1
+                        logger.warning(f"Failed to send message {msg_id}")
+                    
+                    # Update progress every 5 messages
+                    if extracted - last_update >= 5 or i == count - 1:
                         try:
+                            progress = int((i + 1) / count * 100)
                             await progress_msg.edit(
                                 f"⚙️ **Extracting...**\n\n"
                                 f"✅ Done: {extracted}/{count}\n"
                                 f"❌ Failed: {failed}\n"
-                                f"📊 {int(extracted/count*100)}%"
+                                f"📊 Progress: {progress}%"
                             )
                             last_update = extracted
+                        except Exception as edit_err:
+                            logger.warning(f"Progress update failed: {edit_err}")
+                    
+                    # Small delay to avoid flood limits
+                    await asyncio.sleep(1)
+                
+                except Exception as msg_err:
+                    failed += 1
+                    logger.error(f"Error processing message {msg_id}: {msg_err}")
+                    
+                    # Cleanup any leftover file
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
                         except:
                             pass
-                    
-                    await asyncio.sleep(0.5)
                 
-                except Exception as e:
-                    failed += 1
-                    logger.error(f"Extract error {msg_id}: {e}")
+                finally:
+                    # Ensure file cleanup even on errors
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                            logger.info(f"Cleaned up: {file_path}")
+                        except Exception as cleanup_err:
+                            logger.error(f"Cleanup error: {cleanup_err}")
             
-            # Done
+            # Extraction complete
             active_extractions[user_id] = False
             
             success_rate = int((extracted / count) * 100) if count > 0 else 0
@@ -748,16 +782,31 @@ Need help? Just ask! 😊
                 f"❌ Failed: {failed}\n"
                 f"📊 Total: {count}\n"
                 f"📈 Success: {success_rate}%\n\n"
-                f"{'🌟 Perfect!' if success_rate >= 90 else '💡 Some posts were deleted/restricted'}"
+                f"{'🌟 Perfect!' if success_rate >= 90 else '💡 Some posts were deleted/restricted' if success_rate > 0 else '❌ No posts extracted - check if messages exist'}"
             )
-            
-            if client != bot:
-                await client.disconnect()
         
         except Exception as e:
             active_extractions[user_id] = False
-            logger.error(f"Fatal extraction error: {e}")
-            await bot.send_message(user_id, f"❌ **Error:** {str(e)}")
+            logger.error(f"Fatal extraction error: {e}", exc_info=True)
+            await bot.send_message(user_id, f"❌ **Fatal Error:** {str(e)}\n\nPlease try again or contact support.")
+        
+        finally:
+            # GUARANTEED CLEANUP
+            # 1. Disconnect client if needed
+            if client and client != bot:
+                try:
+                    await client.disconnect()
+                    logger.info("Client disconnected")
+                except Exception as disc_err:
+                    logger.error(f"Disconnect error: {disc_err}")
+            
+            # 2. Remove temp directory and all contents
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    logger.info(f"Removed temp directory: {temp_dir}")
+                except Exception as rm_err:
+                    logger.error(f"Error removing temp dir: {rm_err}")
 
     @bot.on(events.CallbackQuery)
     async def callback_handler(event):
@@ -808,7 +857,7 @@ Need help? Just ask! 😊
             logger.error(f"Callback error: {e}")
             await event.respond(f"❌ Error: {str(e)}")
 
-    logger.info("Bot running!")
+    logger.info("Bot is now running and ready!")
     await bot.run_until_disconnected()
 
 async def main():
@@ -818,18 +867,22 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Stopped by user")
     except Exception as e:
-        logger.error(f"Fatal: {e}")
+        logger.error(f"Fatal error in main: {e}", exc_info=True)
         raise
 
 if __name__ == "__main__":
-    logger.info("Starting bot...")
-    logger.info(f"API_ID: {'✅' if API_ID else '❌'}")
-    logger.info(f"API_HASH: {'✅' if API_HASH else '❌'}")
-    logger.info(f"BOT_TOKEN: {'✅' if BOT_TOKEN else '❌'}")
+    logger.info("=" * 50)
+    logger.info("Starting Telegram Extractor Bot...")
+    logger.info("=" * 50)
+    logger.info(f"API_ID: {'✅ Set' if API_ID else '❌ Missing'}")
+    logger.info(f"API_HASH: {'✅ Set' if API_HASH else '❌ Missing'}")
+    logger.info(f"BOT_TOKEN: {'✅ Set' if BOT_TOKEN else '❌ Missing'}")
+    logger.info(f"PORT: {PORT}")
+    logger.info("=" * 50)
     
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Stopped!")
+        logger.info("Bot stopped by user!")
     except Exception as e:
-        logger.error(f"Failed: {e}")
+        logger.error(f"Bot failed to start: {e}", exc_info=True)
